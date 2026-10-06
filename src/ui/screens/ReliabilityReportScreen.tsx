@@ -82,6 +82,24 @@ export const ReliabilityReportScreen: React.FC = () => {
       ? `${(overall.wilsonLow * 100).toFixed(1)}% - ${(overall.wilsonHigh * 100).toFixed(1)}%`
       : '—';
 
+  const costLine =
+    overall && overall.costWinRate !== null && overall.costAvgResultPct !== null
+      ? `After buy/sell spread: win rate ${(overall.costWinRate * 100).toFixed(1)}% (${overall.costSamples} samples), average ${overall.costAvgResultPct >= 0 ? '+' : ''}${overall.costAvgResultPct.toFixed(2)}%`
+      : 'After buy/sell spread: —';
+
+  const liveWinText =
+    overall?.byMode?.live?.winRate !== null && overall?.byMode?.live?.winRate !== undefined
+      ? `${(overall.byMode.live.winRate * 100).toFixed(1)}%`
+      : '—';
+  const catchupWinText =
+    overall?.byMode?.catchup?.winRate !== null && overall?.byMode?.catchup?.winRate !== undefined
+      ? `${(overall.byMode.catchup.winRate * 100).toFixed(1)}%`
+      : '—';
+  const liveSamples = overall ? overall.byMode.live.samples : '—';
+  const catchupSamples = overall ? overall.byMode.catchup.samples : '—';
+
+  const modeLine = `Live: ${liveSamples} · win ${liveWinText}   |   Catch-up: ${catchupSamples} · win ${catchupWinText}`;
+
   const totalPredictions =
     (overall?.samples ?? 0) + (overall?.open ?? 0) + (overall?.ties ?? 0) + (overall?.expired ?? 0);
 
@@ -270,6 +288,11 @@ export const ReliabilityReportScreen: React.FC = () => {
           <span className="text-slate-400">Confidence Range</span>
           <span className="text-slate-300 font-mono font-medium">{confidenceText}</span>
         </div>
+
+        <div className="pt-2 border-t border-slate-800/80 space-y-1 text-[11px] text-slate-400">
+          <div>{costLine}</div>
+          <div>{modeLine}</div>
+        </div>
       </div>
 
       {/* Results vs Random Baseline Section */}
@@ -346,6 +369,9 @@ export const ReliabilityReportScreen: React.FC = () => {
                       >
                         {resText}
                       </span>
+                    )}
+                    {pred.mode === 'catchup' && (
+                      <span className="text-[10px] text-slate-400 font-medium">catch-up</span>
                     )}
                     <span className={`px-2 py-0.5 rounded-full text-[10px] font-semibold border capitalize ${statusCls}`}>
                       {pred.status}

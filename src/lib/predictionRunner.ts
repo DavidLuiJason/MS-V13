@@ -1,13 +1,12 @@
 import Dexie from 'dexie';
 import { db, type PredictionRecord } from '../data/db';
-import { TF_MS, lookalikeDrafts, discoveryDrafts } from '../engine/predictor';
+import { TF_MS, lookalikeDrafts, discoveryDrafts, type PredictionDraft } from '../engine/predictor';
 import { discoverWords, type DiscoveryResult } from '../engine/discovery';
 import type { PatternCandle } from '../engine/patterns';
 import { getOpenPredictions, updatePrediction, addPredictionIfNew } from '../data/predictions';
 import { getSetting, logError } from '../data/repositories';
 
 let busy = false;
-const processedLastT = new Map<string, number>();
 const discoveryCache = new Map<string, { result: DiscoveryResult; t: number }>();
 
 async function runCycle(): Promise<void> {
@@ -43,11 +42,42 @@ async function runCycle(): Promise<void> {
             resultPct *= -1;
           }
 
+          // Spread-aware second score
+          let costResultPct: number | undefined;
+          let costStatus: 'won' | 'lost' | 'tie' | undefined;
+
+          try {
+            const entryBar = await db.quoteBars.get(['binance', p.sym, p.entryT + stepMs - 60000]);
+            const exitBar = await db.quoteBars.get(['binance', p.sym, p.targetT + stepMs - 60000]);
+
+            if (entryBar && exitBar) {
+              if (p.direction === 'up') {
+                if (entryBar.askC > 0) {
+                  costResultPct = ((exitBar.bidC - entryBar.askC) / entryBar.askC) * 100;
+                }
+              } else {
+                if (entryBar.bidC > 0) {
+                  costResultPct = ((entryBar.bidC - exitBar.askC) / entryBar.bidC) * 100;
+                }
+              }
+
+              if (costResultPct !== undefined) {
+                if (costResultPct > 0) costStatus = 'won';
+                else if (costResultPct < 0) costStatus = 'lost';
+                else costStatus = 'tie';
+              }
+            }
+          } catch {
+            // quoteBar query error, leave costResultPct and costStatus undefined
+          }
+
           await updatePrediction(p.id, {
             status,
             exitPrice,
             resultPct,
             scoredAt: Date.now(),
+            costResultPct,
+            costStatus,
           });
         } else if (!candle && now > p.targetT + stepMs + 6 * 3600 * 1000) {
           await updatePrediction(p.id, {
@@ -63,6 +93,7 @@ async function runCycle(): Promise<void> {
     // B) PREDICTION PASS (only if predLabEnabled)
     const predLabEnabled = await getSetting<boolean>('predLabEnabled', false);
     if (!predLabEnabled) {
+      await db.settings.where('key').startsWith('predLab:last:').delete();
       return;
     }
 
@@ -71,14 +102,33 @@ async function runCycle(): Promise<void> {
     const symbols = await getSetting<string[]>('predLabSymbols', defaultSymbols);
     const timeframes = await getSetting<string[]>('predLabTimeframes', ['5m', '15m']);
 
+    // e) Delete 'predLab:last:' records whose pair is not in the currently selected coins x timeframes
+    const validKeys = new Set<string>();
+    for (const sym of symbols) {
+      for (const tf of timeframes) {
+        validKeys.add(`predLab:last:${sym}|${tf}`);
+      }
+    }
+
+    const existingLastRecords = await db.settings
+      .where('key')
+      .startsWith('predLab:last:')
+      .toArray();
+
+    for (const rec of existingLastRecords) {
+      if (!validKeys.has(rec.key)) {
+        await db.settings.delete(rec.key);
+      }
+    }
+
     for (const sym of symbols) {
       for (const tf of timeframes) {
         const pairKey = `${sym}|${tf}`;
+        const lastKey = `predLab:last:${pairKey}`;
         const stepMs = TF_MS[tf] || 60000;
 
-        await new Promise((resolve) => setTimeout(resolve, 50));
-
         try {
+          // b) Load candles exactly as now (newest 20000 closed candles, skip pair if fewer than 500)
           const rows = await db.candles
             .where('[src+sym+tf+t]')
             .between(['binance', sym, tf, Dexie.minKey], ['binance', sym, tf, Dexie.maxKey])
@@ -93,51 +143,101 @@ async function runCycle(): Promise<void> {
 
           if (candles.length < 500) continue;
 
-          const last = candles[candles.length - 1];
-          if (Date.now() - (last.t + stepMs) > 3 * stepMs) {
-            continue; // data is stale
-          }
+          // a) Progress is stored in db.settings under key 'predLab:last:' + sym + '|' + tf with the value entryT (a number)
+          const storedRecord = await db.settings.get(lastKey);
+          const storedValue: number | undefined =
+            storedRecord && typeof storedRecord.value === 'number'
+              ? storedRecord.value
+              : undefined;
 
-          if (processedLastT.get(pairKey) === last.t) {
-            continue;
-          }
-          processedLastT.set(pairKey, last.t);
+          // c) Candidates = candles with t greater than stored value.
+          // If NO stored value exists, only candidate is newest candle (never back-fill on first use).
+          // Ignore candidate whose t + TF_MS[tf] is older than 24 hours before now.
+          const cutoff24h = Date.now() - 24 * 60 * 60 * 1000;
+          let candidateIndices: number[] = [];
 
-          const lDrafts = lookalikeDrafts(candles);
-
-          const cachedDisc = discoveryCache.get(pairKey);
-          let discResult: DiscoveryResult;
-          if (!cachedDisc || Date.now() - cachedDisc.t > 6 * 3600 * 1000) {
-            discResult = discoverWords(candles);
-            discoveryCache.set(pairKey, { result: discResult, t: Date.now() });
+          if (storedValue === undefined) {
+            const lastIdx = candles.length - 1;
+            if (candles[lastIdx].t + stepMs >= cutoff24h) {
+              candidateIndices = [lastIdx];
+            } else {
+              await db.settings.put({ key: lastKey, value: candles[lastIdx].t });
+            }
           } else {
-            discResult = cachedDisc.result;
+            for (let idx = 0; idx < candles.length; idx++) {
+              const c = candles[idx];
+              if (c.t > storedValue) {
+                if (c.t + stepMs >= cutoff24h) {
+                  candidateIndices.push(idx);
+                }
+              }
+            }
+            if (candidateIndices.length === 0 && candles[candles.length - 1].t > storedValue) {
+              await db.settings.put({ key: lastKey, value: candles[candles.length - 1].t });
+            }
           }
-          const dDrafts = discoveryDrafts(discResult);
 
-          const drafts = [...lDrafts, ...dDrafts];
-          for (const draft of drafts) {
-            const id = `${sym}|${tf}|${draft.source}|${draft.note}|${draft.horizon}|${last.t}`;
-            const targetT = last.t + draft.horizon * stepMs;
+          // Sort candidates oldest first (already ascending indices) and handle at most 30 per pair per cycle
+          const candidatesToProcess = candidateIndices.slice(0, 30);
 
-            const rec: PredictionRecord = {
-              id,
-              t: Date.now(),
-              sym,
-              tf,
-              source: draft.source,
-              direction: draft.direction,
-              horizon: draft.horizon,
-              entryT: last.t,
-              entryPrice: last.c,
-              targetT,
-              confidence: draft.confidence,
-              baseline: draft.baseline,
-              note: draft.note,
-              status: 'open',
-            };
+          for (const i of candidatesToProcess) {
+            const candle = candles[i];
+            const isNewest = i === candles.length - 1;
 
-            await addPredictionIfNew(rec);
+            // d) mode = 'live' if Date.now() - (candle.t + TF_MS[tf]) <= 3 * TF_MS[tf], otherwise 'catchup'
+            const mode: 'live' | 'catchup' =
+              Date.now() - (candle.t + stepMs) <= 3 * stepMs ? 'live' : 'catchup';
+
+            // Use ONLY candles[0..i] (candles.slice(0, i + 1)); future must never be visible
+            const historySlice = candles.slice(0, i + 1);
+
+            // Newest gets lookalikeDrafts + discoveryDrafts; older candidates get lookalikeDrafts ONLY
+            const lDrafts = lookalikeDrafts(historySlice);
+            let dDrafts: PredictionDraft[] = [];
+
+            if (isNewest) {
+              const cachedDisc = discoveryCache.get(pairKey);
+              let discResult: DiscoveryResult;
+              if (!cachedDisc || Date.now() - cachedDisc.t > 6 * 3600 * 1000) {
+                discResult = discoverWords(historySlice);
+                discoveryCache.set(pairKey, { result: discResult, t: Date.now() });
+              } else {
+                discResult = cachedDisc.result;
+              }
+              dDrafts = discoveryDrafts(discResult);
+            }
+
+            const drafts = [...lDrafts, ...dDrafts];
+            for (const draft of drafts) {
+              const id = `${sym}|${tf}|${draft.source}|${draft.note}|${draft.horizon}|${candle.t}`;
+              const targetT = candle.t + draft.horizon * stepMs;
+
+              const rec: PredictionRecord = {
+                id,
+                t: Date.now(),
+                sym,
+                tf,
+                source: draft.source,
+                direction: draft.direction,
+                horizon: draft.horizon,
+                entryT: candle.t,
+                entryPrice: candle.c,
+                targetT,
+                confidence: draft.confidence,
+                baseline: draft.baseline,
+                note: draft.note,
+                status: 'open',
+                mode,
+              };
+
+              await addPredictionIfNew(rec);
+            }
+
+            // Write the 'predLab:last:...' value = candle.t, even if it produced no draft
+            await db.settings.put({ key: lastKey, value: candle.t });
+
+            // 50 ms pause (setTimeout) after each candidate so the phone stays smooth
+            await new Promise((resolve) => setTimeout(resolve, 50));
           }
         } catch (err) {
           logError('PredictionRunner', `Prediction pass failed for ${pairKey}: ${String(err)}`);

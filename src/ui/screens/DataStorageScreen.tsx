@@ -5,7 +5,7 @@ import { formatBytes } from '../../lib/formatters';
 import { exportDataZip, exportCandlesCsv, importDataZip, type ExportScope, type ImportSummary } from '../../lib/exportImport';
 import { saveAndShareFile, exportCandlesCsvInChunks } from '../../lib/saveAndShare';
 import { workerClient } from '../../collector/workerClient';
-import type { CollectorLogRecord } from '../../data/db';
+import { db, type CollectorLogRecord } from '../../data/db';
 import {
   Database,
   CheckCircle2,
@@ -167,7 +167,9 @@ export const DataStorageScreen: React.FC = () => {
           ? stats.candlesCount
           : exportScope === 'liquidity'
             ? stats.ticksCount + stats.quoteBarsCount
-            : 0;
+            : exportScope === 'predictions'
+              ? await db.predictions.count()
+              : 0;
     if (scopeRows > 600000) {
       alert(
         `This export has about ${scopeRows.toLocaleString()} rows, which is too many for one archive on this phone. Use "Export Candles (CSV)" for candles, or pick a smaller data type.`
@@ -722,6 +724,7 @@ export const DataStorageScreen: React.FC = () => {
                 { id: 'all', label: 'All Data', desc: 'Candles, ticks, quote bars, gaps, and settings' },
                 { id: 'candles', label: 'Candles', desc: 'Candlestick OHLCV data across timeframes' },
                 { id: 'liquidity', label: 'Order Book Data', desc: 'Buy/sell price ticks and 1m quote bars' },
+                { id: 'predictions', label: 'Predictions', desc: 'Every prediction the app made and how it turned out' },
                 { id: 'settings_profiles', label: 'Settings & Profiles', desc: 'Configuration and clicker marker profiles' },
               ].map((opt) => (
                 <button

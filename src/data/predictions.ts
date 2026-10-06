@@ -16,6 +16,13 @@ export interface PredictionStatsGroup {
   wilsonLow: number | null;
   wilsonHigh: number | null;
   verdict: 'Too early (needs 100)' | 'Beats random' | 'Worse than random' | 'Not proven';
+  costSamples: number;
+  costWinRate: number | null;
+  costAvgResultPct: number | null;
+  byMode: {
+    live: { samples: number; winRate: number | null };
+    catchup: { samples: number; winRate: number | null };
+  };
 }
 
 export interface PredictionStatsResult {
@@ -62,6 +69,15 @@ function computeStatsForGroup(records: PredictionRecord[]): PredictionStatsGroup
   let gainSum = 0;
   let lossSum = 0;
 
+  let costWins = 0;
+  let costLosses = 0;
+  let costSum = 0;
+
+  let liveWins = 0;
+  let liveSamples = 0;
+  let catchupWins = 0;
+  let catchupSamples = 0;
+
   for (const r of records) {
     if (r.status === 'won') {
       wins++;
@@ -69,11 +85,25 @@ function computeStatsForGroup(records: PredictionRecord[]): PredictionStatsGroup
       if (typeof r.resultPct === 'number') {
         gainSum += r.resultPct;
       }
+      const mode = r.mode || 'live';
+      if (mode === 'catchup') {
+        catchupSamples++;
+        catchupWins++;
+      } else {
+        liveSamples++;
+        liveWins++;
+      }
     } else if (r.status === 'lost') {
       losses++;
       baselineSum += r.baseline;
       if (typeof r.resultPct === 'number') {
         lossSum += r.resultPct;
+      }
+      const mode = r.mode || 'live';
+      if (mode === 'catchup') {
+        catchupSamples++;
+      } else {
+        liveSamples++;
       }
     } else if (r.status === 'tie') {
       ties++;
@@ -82,7 +112,34 @@ function computeStatsForGroup(records: PredictionRecord[]): PredictionStatsGroup
     } else if (r.status === 'expired') {
       expired++;
     }
+
+    if (r.costStatus === 'won') {
+      costWins++;
+      if (typeof r.costResultPct === 'number') {
+        costSum += r.costResultPct;
+      }
+    } else if (r.costStatus === 'lost') {
+      costLosses++;
+      if (typeof r.costResultPct === 'number') {
+        costSum += r.costResultPct;
+      }
+    }
   }
+
+  const costSamples = costWins + costLosses;
+  const costWinRate = costSamples > 0 ? costWins / costSamples : null;
+  const costAvgResultPct = costSamples > 0 ? costSum / costSamples : null;
+
+  const byMode = {
+    live: {
+      samples: liveSamples,
+      winRate: liveSamples > 0 ? liveWins / liveSamples : null,
+    },
+    catchup: {
+      samples: catchupSamples,
+      winRate: catchupSamples > 0 ? catchupWins / catchupSamples : null,
+    },
+  };
 
   const samples = wins + losses;
   if (samples === 0) {
@@ -101,6 +158,10 @@ function computeStatsForGroup(records: PredictionRecord[]): PredictionStatsGroup
       wilsonLow: null,
       wilsonHigh: null,
       verdict: 'Too early (needs 100)',
+      costSamples,
+      costWinRate,
+      costAvgResultPct,
+      byMode,
     };
   }
 
@@ -140,6 +201,10 @@ function computeStatsForGroup(records: PredictionRecord[]): PredictionStatsGroup
     wilsonLow,
     wilsonHigh,
     verdict,
+    costSamples,
+    costWinRate,
+    costAvgResultPct,
+    byMode,
   };
 }
 

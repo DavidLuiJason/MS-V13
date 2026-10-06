@@ -111,6 +111,9 @@ export interface PredictionRecord {
   exitPrice?: number;
   resultPct?: number;
   scoredAt?: number;
+  mode?: 'live' | 'catchup';
+  costResultPct?: number;
+  costStatus?: 'won' | 'lost' | 'tie';
 }
 
 export class MarketScopeDatabase extends Dexie {
